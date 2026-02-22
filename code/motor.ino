@@ -2,28 +2,35 @@
 #include <LiquidCrystal.h>
 #include <math.h>
 
+// Structure used to implement software debouncing for push-buttons
 struct DebouncedButton {
-  uint8_t pin;
-  bool lastStable;
-  bool lastReading;
-  uint32_t lastChangeMs;
+  uint8_t pin;            // Arduino pin the button is connected to
+  bool lastStable;        // Last debounced stable logic level
+  bool lastReading;       // Last instantaneous reading
+  uint32_t lastChangeMs;  // Time of last state change (for debounce timing)
 };
 
+// Speed staging enum used for selecting motor PWM level
 enum SpeedClass : uint8_t { SPEED_LOW = 0, SPEED_MED = 1, SPEED_HIGH = 2 };
 
+// Forward declaration of button edge detection function
 bool buttonPressedEdge(DebouncedButton &b);
 
+// Encoder A and B channel input pins
 const uint8_t PIN_ENC_A   = 2;
 const uint8_t PIN_ENC_B   = 4;
 
-const uint8_t PIN_PWM     = 5;
-const uint8_t PIN_INB     = 6;
-const uint8_t PIN_INA     = 7;
+// H-bridge motor driver pins
+const uint8_t PIN_PWM     = 5; // PWM speed control
+const uint8_t PIN_INB     = 6; // Direction input B
+const uint8_t PIN_INA     = 7; // Direction input A
 
-const uint8_t PIN_BTN_EXEC = 8;
-const uint8_t PIN_BTN_SPD  = 9;
-const uint8_t PIN_BTN_DIR  = 10;
+// User interface push-buttons
+const uint8_t PIN_BTN_EXEC = 8;  // Start/Stop motor
+const uint8_t PIN_BTN_SPD  = 9;  // Cycle speed
+const uint8_t PIN_BTN_DIR  = 10; // Toggle direction
 
+// LCD pin definitions
 const uint8_t LCD_RS = 12;
 const uint8_t LCD_E  = 11;
 const uint8_t LCD_D4 = A0;
@@ -31,17 +38,27 @@ const uint8_t LCD_D5 = A1;
 const uint8_t LCD_D6 = A2;
 const uint8_t LCD_D7 = A3;
 
+// Create LCD object (16x2 parallel interface)
 LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
+// Encoder counts per revolution (gearbox output shaft)
 const int32_t CPR_GEARBOX = 700;
+
+// Using x4 quadrature decoding → effective counts per rev
 const int32_t COUNTS_PER_REV_GEARBOX = CPR_GEARBOX * 4;
 
+// RPM sampling interval in microseconds (50 ms)
 const uint32_t SAMPLE_US = 50000;
+
+// Low-pass filter constant for angular velocity smoothing
 const float OMEGA_ALPHA = 0.25f;
 
+// Encoder count updated inside interrupt
 volatile int32_t encCount = 0;
 
 
+// Quadrature decoding lookup table
+// Maps previous AB state and current AB state to count increment/decrement
 static const int8_t QUAD_TABLE[16] = {
   0, -1, +1,  0,
  +1,  0,  0, -1,
@@ -49,9 +66,11 @@ static const int8_t QUAD_TABLE[16] = {
   0, +1, -1,  0
 };
 
+// Previous encoder A/B state
 volatile uint8_t prevAB = 0;
 
 
+// Reads encoder A and B channel logic levels directly from PORTD register
 inline uint8_t readAB() {
   uint8_t p = PIND;
   uint8_t a = (p >> PD2) & 0x01;
@@ -59,6 +78,7 @@ inline uint8_t readAB() {
   return (uint8_t)((a << 1) | b);
 }
 
+// Pin Change Interrupt Service Routine for encoder channels
 ISR(PCINT2_vect) {
   uint8_t currAB = readAB();
   uint8_t idx = (uint8_t)((prevAB << 2) | currAB);
@@ -66,6 +86,7 @@ ISR(PCINT2_vect) {
   prevAB = currAB;
 }
 
+// Configure pin change interrupts for encoder pins
 void setupEncoderPCINT() {
   pinMode(PIN_ENC_A, INPUT);
   pinMode(PIN_ENC_B, INPUT);
@@ -78,6 +99,7 @@ void setupEncoderPCINT() {
   PCMSK2 |= (1 << PCINT20);
 }
 
+// Safely read encoder count atomically
 int32_t getEncCountAtomic() {
   int32_t c;
   noInterrupts();
@@ -87,18 +109,24 @@ int32_t getEncCountAtomic() {
 }
 
 
+// Current applied PWM command
 uint8_t pwmCmd = 0;
+
+// Current applied direction
 bool dirForward = true;
 
 
+// Desired staged settings from UI
 bool desiredForward = true;
 SpeedClass desiredSpeed = SPEED_LOW;
 bool motorOn = false;
 
+// PWM values for speed classes
 const uint8_t PWM_LOW  = 50;
 const uint8_t PWM_MED  = 80;
 const uint8_t PWM_HIGH = 120;
 
+// Returns PWM value based on selected speed class
 uint8_t pwmFromClass(SpeedClass s) {
   switch (s) {
     case SPEED_LOW:  return PWM_LOW;
@@ -107,21 +135,31 @@ uint8_t pwmFromClass(SpeedClass s) {
   }
 }
 
+// Shaft diameter in meters (used for length estimation)
 const float SHAFT_DIAMETER_M = 0.026f;
+
+// Shaft circumference
 const float SHAFT_CIRCUM_M   = PI * SHAFT_DIAMETER_M;
 
-int32_t onStartCount = 0;  
+// Encoder count at motor start
+int32_t onStartCount = 0;
+
+// Total measured length moved
 float totalLengthM = 0.0f;
 
+// LCD refresh rate for length display
 const uint32_t LCD_LEN_UPDATE_MS = 200;
 uint32_t lastLcdLenUpdateMs = 0;
 
+// Debounce timing
 const uint32_t DEBOUNCE_MS = 30;
 
+// Debounced button objects
 DebouncedButton btnDir  {PIN_BTN_DIR,  false, false, 0};
 DebouncedButton btnSpd  {PIN_BTN_SPD,  false, false, 0};
 DebouncedButton btnExec {PIN_BTN_EXEC, false, false, 0};
 
+// Rising-edge detection with debounce
 bool buttonPressedEdge(DebouncedButton &b) {
   bool reading = digitalRead(b.pin);
   uint32_t now = millis();
@@ -139,6 +177,7 @@ bool buttonPressedEdge(DebouncedButton &b) {
 }
 
 
+// Apply motor direction and PWM command
 void applyMotorCommand() {
   if (dirForward) {
     digitalWrite(PIN_INA, HIGH);
@@ -150,11 +189,13 @@ void applyMotorCommand() {
   analogWrite(PIN_PWM, pwmCmd);
 }
 
+// Immediately stop motor
 void stopMotor() {
   pwmCmd = 0;
   analogWrite(PIN_PWM, 0);
 }
 
+// Apply staged settings and start motor
 void applyStagedSettingsAndStart() {
 
   dirForward = desiredForward;
@@ -167,6 +208,7 @@ void applyStagedSettingsAndStart() {
 }
 
 
+// Returns string representation of speed class
 const char* speedStr(SpeedClass s) {
   switch (s) {
     case SPEED_LOW:  return "LOW";
@@ -175,6 +217,7 @@ const char* speedStr(SpeedClass s) {
   }
 }
 
+// Update LCD line 1 with direction, speed and motor state
 void lcdPrintLine1() {
   lcd.setCursor(0, 0);
 
@@ -194,6 +237,7 @@ void lcdPrintLine1() {
   lcd.print("       ");
 }
 
+// Update LCD line 2 with measured length
 void lcdPrintLine2Len(float meters) {
   lcd.setCursor(0, 1);
   lcd.print("LEN:");
@@ -202,6 +246,7 @@ void lcdPrintLine2Len(float meters) {
   lcd.print("        ");
 }
 
+// Arduino setup routine
 void setup() {
   Serial.begin(115200);
 
@@ -242,6 +287,7 @@ void setup() {
   Serial.println(SHAFT_CIRCUM_M, 6);
 }
 
+// Main loop
 void loop() {
   if (buttonPressedEdge(btnDir)) {
     desiredForward = !desiredForward;
